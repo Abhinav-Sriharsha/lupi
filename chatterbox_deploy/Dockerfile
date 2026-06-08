@@ -23,4 +23,4 @@ COPY chatterbox_server.py .
 
 EXPOSE 8881
 
-CMD ["uvicorn", "chatterbox_server:app", "--host", "0.0.0.0", "--port", "8881"]
+CMD ["sh", "-c", "uvicorn chatterbox_server:app --host 0.0.0.0 --port ${PORT:-8881}"]
