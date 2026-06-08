@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-dotenv
+livekit
+livekit-api
+livekit-agents[deepgram,silero,groq]>=1.5.0
+supabase
+groq
