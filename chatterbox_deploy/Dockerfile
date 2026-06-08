@@ -1,13 +1,14 @@
-FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
 
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
-    chatterbox-tts \
-    torchaudio \
+    "chatterbox-tts" \
+    "torchaudio>=2.4.0" \
     fastapi \
     uvicorn \
-    numpy
+    numpy \
+    "optree>=0.13.0"
 
 COPY chatterbox_server.py .
 
