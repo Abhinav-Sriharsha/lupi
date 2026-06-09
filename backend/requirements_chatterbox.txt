@@ -1,0 +1,6 @@
+chatterbox-tts
+torch
+torchaudio
+fastapi
+uvicorn
+numpy

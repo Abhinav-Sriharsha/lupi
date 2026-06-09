@@ -174,7 +174,5 @@ async def synthesize_cache(request: TTSRequest):
 
 
 if __name__ == "__main__":
-    import os
     import uvicorn
-    PORT = int(os.environ.get("PORT", 8881))
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+    uvicorn.run(app, host="127.0.0.1", port=8881, log_level="warning")

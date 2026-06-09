@@ -103,9 +103,18 @@ Do not repeat the resolution. Do not offer alternatives unless asked.
 """,
 
     LupiStage.CLOSING: """CURRENT STAGE: CLOSING
-You asked if there is anything else. Wait for the customer's response.
-If yes — say "Of course" and stop. The system will route the new issue.
-If no — say exactly: "Have a great day, goodbye!"
+The issue has been resolved.
+Say: "Is there anything else I can help you with today?"
+
+If customer says no or goodbye: say "Have a great day, goodbye!"
+
+If customer asks anything about their order, items, delivery,
+or dasher: respond with the single word FOLLOW_UP and stop.
+Do not answer the question. Do not make up information.
+The system will route back to investigation automatically.
+
+For anything unrelated to their order:
+say "For anything else please visit our support page."
 """,
 }
 
@@ -126,6 +135,7 @@ TRANSITIONS = {
     (LupiStage.INVESTIGATION, "skip_resolution"): LupiStage.CLOSING,
     (LupiStage.RESOLUTION, "resolved"): LupiStage.CLOSING,
     (LupiStage.CLOSING, "another_issue"): LupiStage.INVESTIGATION,
+    (LupiStage.CLOSING, "follow_up_question"): LupiStage.INVESTIGATION,
 }
 
 

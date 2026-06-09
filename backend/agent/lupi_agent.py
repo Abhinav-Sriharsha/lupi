@@ -366,6 +366,10 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             print(f"[FSM] _enter_greeted error: {e}")
 
+    async def _handle_follow_up():
+        await fsm.enter("follow_up_question", session, tools_registry)
+        rebuild_agent()
+
     async def _ask_for_more_digits():
         await asyncio.sleep(0.1)
         try:
@@ -422,6 +426,10 @@ async def entrypoint(ctx: JobContext):
             response = msg.text_content or ""
             print(f"[AGENT]: {response}")
             observer.on_agent_speech_committed(response)
+            # Detect FOLLOW_UP signal from LLM
+            if "FOLLOW_UP" in response.upper() and fsm.stage == LupiStage.CLOSING:
+                print("[FSM] Follow-up detected — routing back to investigation")
+                asyncio.create_task(_handle_follow_up())
 
     @session.on("agent_state_changed")
     def on_agent_state(ev):
