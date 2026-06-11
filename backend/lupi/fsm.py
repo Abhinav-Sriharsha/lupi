@@ -314,6 +314,7 @@ class LupiFSM:
         self.order_details: dict = {}
         self.order_status: dict = {}
         self.eligibility: dict = {}
+        self.on_stage_change = None
 
     def transition(self, event: str) -> bool:
         key = (self.stage, event)
@@ -328,6 +329,8 @@ class LupiFSM:
     async def enter(self, event: str, session, tools_registry: dict) -> bool:
         if not self.transition(event):
             return False
+        if self.on_stage_change is not None:
+            self.on_stage_change(self.stage.value)
         handler = ON_ENTER.get(self.stage)
         if handler is not None:
             await handler(self, session, tools_registry)

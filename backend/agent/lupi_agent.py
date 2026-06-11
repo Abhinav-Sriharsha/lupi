@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import asyncio
 import aiohttp
@@ -28,6 +29,7 @@ from livekit.plugins import openai as lk_openai
 from openai import AsyncOpenAI
 
 from kokoro_tts_plugin import KokoroTTS as KokoroTTSPlugin
+from resemble_tts_plugin import ResembleTTS
 from lupi.classifier import classify_issue
 from lupi.fsm import LupiFSM, LupiStage, STAGE_TOOLS
 from lupi.tools import (
@@ -54,7 +56,8 @@ class TurnMetrics:
     response: str = ""
     ttft_ms: float = 0
     llm_ms: float = 0
-    tts_ms: float = 0
+    tts_first_chunk_ms: float = 0
+    tts_total_ms: float = 0
     total_ms: float = 0
 
 
@@ -82,8 +85,8 @@ class SessionObserver:
             self.current.llm_ms = round(agent_metrics.inference_duration * 1000)
             print(f"[LATENCY] LLM: {self.current.llm_ms}ms")
         if hasattr(agent_metrics, "duration") and agent_metrics.duration:
-            self.current.tts_ms = round(agent_metrics.duration * 1000)
-            print(f"[LATENCY] TTS: {self.current.tts_ms}ms")
+            self.current.tts_total_ms = round(agent_metrics.duration * 1000)
+            print(f"[LATENCY] TTS: {self.current.tts_total_ms}ms")
 
     def on_agent_speech_committed(self, response: str):
         if self.current:
@@ -97,7 +100,8 @@ class SessionObserver:
         if self.turns:
             totals = [t.total_ms for t in self.turns if t.total_ms > 0]
             ttfts  = [t.ttft_ms  for t in self.turns if t.ttft_ms  > 0]
-            tts    = [t.tts_ms   for t in self.turns if t.tts_ms   > 0]
+            tts    = [t.tts_total_ms for t in self.turns if t.tts_total_ms > 0]
+            ttfas  = [t.ttft_ms + t.tts_first_chunk_ms for t in self.turns if t.tts_first_chunk_ms > 0]
             if totals:
                 print(f"Avg turn latency : {sum(totals)/len(totals):.0f}ms")
                 print(f"Best turn        : {min(totals):.0f}ms")
@@ -106,11 +110,13 @@ class SessionObserver:
                 print(f"Avg TTFT         : {sum(ttfts)/len(ttfts):.0f}ms")
                 print(f"Best TTFT        : {min(ttfts):.0f}ms")
             if tts:
-                print(f"Avg TTS          : {sum(tts)/len(tts):.0f}ms")
-                print(f"Best TTS         : {min(tts):.0f}ms")
+                print(f"Avg TTS total    : {sum(tts)/len(tts):.0f}ms")
+                print(f"Best TTS total   : {min(tts):.0f}ms")
+            if ttfas:
+                print(f"Avg TTFA         : {sum(ttfas)/len(ttfas):.0f}ms")
             print(f"{'─'*50}")
             for t in self.turns:
-                print(f"  Turn {t.turn}: total={t.total_ms}ms ttft={t.ttft_ms}ms tts={t.tts_ms}ms")
+                print(f"  Turn {t.turn}: total={t.total_ms}ms ttft={t.ttft_ms}ms tts={t.tts_total_ms}ms ttfa={t.ttft_ms + t.tts_first_chunk_ms}ms")
                 print(f"    User : {t.transcript[:80]}")
                 print(f"    Agent: {t.response[:80]}")
         print(f"{'='*50}\n")
@@ -201,7 +207,18 @@ async def entrypoint(ctx: JobContext):
 
     observer = SessionObserver()
 
+    async def publish_fsm_stage(stage: str):
+        payload = json.dumps({"type": "fsm_stage", "stage": stage})
+        try:
+            await ctx.room.local_participant.publish_data(
+                payload.encode("utf-8"), reliable=True
+            )
+            print(f"[FSM] Published stage: {stage}")
+        except Exception as e:
+            print(f"[FSM] Stage publish failed: {e}")
+
     fsm = LupiFSM()
+    fsm.on_stage_change = lambda stage: asyncio.create_task(publish_fsm_stage(stage))
     print(f"[FSM] Initialized: {fsm.stage.value}")
 
     state = {"greeting_done": False, "phone_done": False}
@@ -227,6 +244,8 @@ async def entrypoint(ctx: JobContext):
     phrase_cache: dict[str, bytes] = {}
 
     async def precache_phrase(text: str, key: str):
+        if os.getenv("USE_RESEMBLE", "false").lower() == "true":
+            return
         kokoro_url = os.getenv("KOKORO_URL", "http://127.0.0.1:8880")
         try:
             async with aiohttp.ClientSession() as http:
@@ -251,11 +270,25 @@ async def entrypoint(ctx: JobContext):
         punctuate=True,
         smart_format=True,
     )
-    lupi_tts = KokoroTTSPlugin(
-        voice="af_sarah",
-        speed=1.1,
-        base_url=kokoro_url,
-    )
+    use_resemble = os.getenv("USE_RESEMBLE", "false").lower() == "true"
+    if use_resemble:
+        lupi_tts = ResembleTTS(
+            api_key=os.getenv("RESEMBLE_API_KEY"),
+            voice_uuid=os.getenv("RESEMBLE_VOICE_UUID"),
+            rate="100%"
+        )
+        print("[TTS] Using Resemble AI")
+    else:
+        lupi_tts = KokoroTTSPlugin(voice="af_sarah", speed=1.1, base_url=kokoro_url)
+        print("[TTS] Using Kokoro local")
+
+    def capture_kokoro_ttfc():
+        """Read and reset Kokoro's first-chunk latency."""
+        if hasattr(lupi_tts, 'last_ttfc_ms'):
+            ttfc = lupi_tts.last_ttfc_ms
+            lupi_tts.last_ttfc_ms = 0
+            return ttfc
+        return 0
     lupi_vad = silero.VAD.load(
         min_speech_duration=0.1,
         min_silence_duration=0.5,
@@ -419,13 +452,38 @@ async def entrypoint(ctx: JobContext):
 
         # All other stages: pass through to LLM
 
+    # ── Metrics → frontend via data channel ────────────────────────────────────
+
+    async def publish_turn_metrics(turn: TurnMetrics):
+        payload = json.dumps({
+            "type": "metrics",
+            "turn": turn.turn,
+            "ttft_ms": turn.ttft_ms,
+            "tts_first_chunk_ms": turn.tts_first_chunk_ms,
+            "tts_total_ms": turn.tts_total_ms,
+            "ttfa_ms": turn.ttft_ms + turn.tts_first_chunk_ms,
+            "total_ms": turn.total_ms,
+        })
+        try:
+            await ctx.room.local_participant.publish_data(
+                payload.encode("utf-8"), reliable=True
+            )
+            print(f"[METRICS] Published: {payload}")
+        except Exception as e:
+            print(f"[METRICS] Publish failed: {e}")
+
     @session.on("conversation_item_added")
     def on_item_added(ev):
         msg = ev.item
         if hasattr(msg, "role") and msg.role == "assistant":
             response = msg.text_content or ""
             print(f"[AGENT]: {response}")
+            if observer.current:
+                observer.current.tts_first_chunk_ms = capture_kokoro_ttfc()
+                print(f"[LATENCY] TTS first chunk: {observer.current.tts_first_chunk_ms}ms")
             observer.on_agent_speech_committed(response)
+            if observer.current:
+                asyncio.create_task(publish_turn_metrics(observer.current))
             # Detect FOLLOW_UP signal from LLM
             if "FOLLOW_UP" in response.upper() and fsm.stage == LupiStage.CLOSING:
                 print("[FSM] Follow-up detected — routing back to investigation")
@@ -446,6 +504,7 @@ async def entrypoint(ctx: JobContext):
     print(f"[LUPI] Participant: {participant.identity}")
 
     await session.start(agent, room=ctx.room)
+    asyncio.create_task(publish_fsm_stage(fsm.stage.value))
 
     @session.on("participant_disconnected")
     def on_disconnect(p):

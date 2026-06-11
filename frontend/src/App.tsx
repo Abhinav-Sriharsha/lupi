@@ -1,408 +1,277 @@
-import { useState, useCallback, useRef, useEffect, Fragment } from 'react'
-import {
-  LiveKitRoom,
-  useVoiceAssistant,
-  BarVisualizer,
-  RoomAudioRenderer,
-  useLocalParticipant,
-} from '@livekit/components-react'
-import type { TranscriptionSegment, TrackPublication } from 'livekit-client'
-import '@livekit/components-styles'
+import { useEffect, useRef, useState } from 'react'
 import './App.css'
+import { Reveal } from './components/landing/reveal'
+import { VoiceStage } from './components/landing/voice-stage'
 
-type CallState = 'idle' | 'connecting' | 'connected' | 'disconnected'
+// ── Wordmark ───────────────────────────────────────────────────────────────────
 
-interface TranscriptLine {
-  id: string
-  speaker: 'user' | 'agent'
-  text: string
-  final: boolean
-}
-
-interface ActivityEvent {
-  id: string
-  timestamp: string
-  label: string
-  type: 'stage' | 'tool' | 'success' | 'error'
-}
-
-type PushActivityFn = (event: Omit<ActivityEvent, 'id' | 'timestamp'>) => void
-
-const DOT_COLORS: Record<ActivityEvent['type'], string> = {
-  stage:   '#3b82f6',
-  tool:    '#f97316',
-  success: '#22c55e',
-  error:   '#ef4444',
-}
-
-const STATE_LABELS: Record<string, string> = {
-  disconnected: 'IDLE',
-  connecting:   'CONNECTING',
-  initializing: 'INITIALIZING',
-  listening:    'LISTENING',
-  thinking:     'PROCESSING',
-  speaking:     'SPEAKING',
-}
-
-const STATE_ACTIVITY: Record<string, { label: string; type: ActivityEvent['type'] }> = {
-  initializing: { label: 'Connecting',  type: 'stage' },
-  listening:    { label: 'Listening',   type: 'stage' },
-  thinking:     { label: 'Processing',  type: 'stage' },
-  speaking:     { label: 'Speaking',    type: 'stage' },
-}
-
-const FSM_STAGES = [
-  'INTRO',
-  'PHONE COLLECTION',
-  'ISSUE COLLECTION',
-  'INVESTIGATION',
-  'RESOLUTION',
-  'CLOSING',
-] as const
-
-const FSM_STATUS: Record<number, string> = {
-  0: 'exchanging greeting',
-  1: 'collecting phone number',
-  2: 'identifying issue',
-  3: 'fetching order data',
-  4: 'processing resolution',
-  5: 'wrapping up',
-}
-
-function formatTime(d: Date): string {
-  return d.toLocaleTimeString('en-US', {
-    hour12: false,
-    hour:   '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  })
-}
-
-function formatDuration(total: number): string {
-  const m = Math.floor(total / 60).toString().padStart(2, '0')
-  const s = (total % 60).toString().padStart(2, '0')
-  return `${m}:${s}`
-}
-
-function VoiceAgent({
-  onDisconnect,
-  onActivity,
-  onFsmAdvance,
-  callDuration,
-}: {
-  onDisconnect: () => void
-  onActivity: PushActivityFn
-  onFsmAdvance: (stage: number) => void
-  callDuration: number
-}) {
-  const { state, audioTrack, agent } = useVoiceAssistant()
-  const { localParticipant } = useLocalParticipant()
-  const [transcript, setTranscript] = useState<TranscriptLine[]>([])
-  const prevStateRef    = useRef<string>('')
-  const userTurnCount   = useRef(0)
-  const countedUserSegs  = useRef(new Set<string>())
-  const countedAgentSegs = useRef(new Set<string>())
-
-  // Agent state → activity feed
-  useEffect(() => {
-    if (state !== prevStateRef.current && STATE_ACTIVITY[state]) {
-      onActivity(STATE_ACTIVITY[state])
-      prevStateRef.current = state
-    }
-  }, [state, onActivity])
-
-  // Advance FSM stage by watching finalized transcript entries
-  useEffect(() => {
-    transcript.forEach(line => {
-      if (!line.final) return
-      if (line.speaker === 'user' && !countedUserSegs.current.has(line.id)) {
-        countedUserSegs.current.add(line.id)
-        userTurnCount.current += 1
-        const n = userTurnCount.current
-        if (n === 1) onFsmAdvance(1)
-        else if (n === 2) onFsmAdvance(2)
-        else if (n === 3) onFsmAdvance(3)
-      } else if (line.speaker === 'agent' && !countedAgentSegs.current.has(line.id)) {
-        countedAgentSegs.current.add(line.id)
-        const u = userTurnCount.current
-        if (u === 3) onFsmAdvance(4)
-        else if (u >= 4) onFsmAdvance(5)
-      }
-    })
-  }, [transcript, onFsmAdvance])
-
-  // Agent transcription
-  useEffect(() => {
-    if (!agent) return
-    const handle = (segments: TranscriptionSegment[], _pub?: TrackPublication) => {
-      segments.forEach(seg => {
-        if (seg.final) onActivity({ label: 'Response generated', type: 'success' })
-        setTranscript(prev => {
-          const key = `agent-${seg.id}`
-          const idx = prev.findIndex(t => t.id === key)
-          const line: TranscriptLine = { id: key, speaker: 'agent', text: seg.text, final: seg.final }
-          if (idx >= 0) {
-            const next = [...prev]
-            next[idx] = line
-            return next
-          }
-          return [...prev, line].slice(-12)
-        })
-      })
-    }
-    agent.on('transcriptionReceived', handle)
-    return () => { agent.off('transcriptionReceived', handle) }
-  }, [agent, onActivity])
-
-  // User transcription
-  useEffect(() => {
-    if (!localParticipant) return
-    const handle = (segments: TranscriptionSegment[], _pub?: TrackPublication) => {
-      segments.forEach(seg => {
-        if (seg.final) onActivity({ label: 'User input received', type: 'tool' })
-        setTranscript(prev => {
-          const key = `user-${seg.id}`
-          const idx = prev.findIndex(t => t.id === key)
-          const line: TranscriptLine = { id: key, speaker: 'user', text: seg.text, final: seg.final }
-          if (idx >= 0) {
-            const next = [...prev]
-            next[idx] = line
-            return next
-          }
-          return [...prev, line].slice(-12)
-        })
-      })
-    }
-    localParticipant.on('transcriptionReceived', handle)
-    return () => { localParticipant.off('transcriptionReceived', handle) }
-  }, [localParticipant, onActivity])
-
-  const last3 = transcript.slice(-3)
-  const orbClass =
-    state === 'listening' ? 'orb-listening'
-    : state === 'thinking' ? 'orb-thinking'
-    : state === 'speaking' ? 'orb-speaking'
-    : 'orb-idle'
-
+function Wordmark() {
   return (
-    <>
-      <div className="center-section">
-        <div className={`orb-wrap ${orbClass}`}>
-          <div className="orb">
-            {state === 'thinking' && <div className="orb-ring" />}
-            <div className="orb-viz">
-              <BarVisualizer
-                state={state}
-                track={audioTrack}
-                barCount={20}
-                style={{ height: '60px', width: '100%' }}
-              />
-            </div>
-          </div>
-          <div className="orb-label">{STATE_LABELS[state] ?? 'IDLE'}</div>
-          <div className="orb-timer">{formatDuration(callDuration)}</div>
-        </div>
-      </div>
-
-      <div className="bottom-section">
-        <div className="transcript-lines">
-          {last3.map(line => (
-            <div
-              key={line.id}
-              className={`t-entry t-${line.speaker}${line.final ? '' : ' t-interim'}`}
-            >
-              {line.speaker === 'agent' && <span className="t-dash">&#8212;</span>}
-              <span className="t-text">{line.text}</span>
-            </div>
-          ))}
-        </div>
-        <div className="action-row action-right">
-          <button className="btn-terminate" onClick={onDisconnect}>TERMINATE</button>
-        </div>
-      </div>
-    </>
+    <div className="wordmark">
+      <span className="seam" />
+      <span className="dot" />
+      <span className="vt">LUPI</span>
+      <span className="seam b" />
+    </div>
   )
 }
 
-export default function App() {
-  const [callState, setCallState]       = useState<CallState>('idle')
-  const [token, setToken]               = useState('')
-  const [livekitUrl, setLivekitUrl]     = useState('')
-  const [error, setError]               = useState('')
-  const [activity, setActivity]         = useState<ActivityEvent[]>([])
-  const [callDuration, setCallDuration] = useState(0)
-  const [fsmStage, setFsmStage]         = useState(0)
-  const abortRef = useRef<AbortController | null>(null)
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+// ── Contact popover ──────────────────────────────────────────────────────────────
 
-  const pushActivity = useCallback<PushActivityFn>(event => {
-    setActivity(prev => {
-      const entry: ActivityEvent = {
-        ...event,
-        id:        `${Date.now()}-${Math.random()}`,
-        timestamp: formatTime(new Date()),
-      }
-      return [entry, ...prev].slice(0, 12)
-    })
-  }, [])
-
-  const handleFsmAdvance = useCallback((stage: number) => {
-    setFsmStage(stage)
-  }, [])
+function ContactCard() {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    if (callState === 'connected') {
-      setCallDuration(0)
-      timerRef.current = setInterval(() => setCallDuration(d => d + 1), 1000)
-    } else {
-      if (timerRef.current) {
-        clearInterval(timerRef.current)
-        timerRef.current = null
-      }
+    const onDocClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
     }
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current)
-    }
-  }, [callState])
-
-  const startCall = useCallback(async () => {
-    setError('')
-    setFsmStage(0)
-    setCallState('connecting')
-    pushActivity({ label: 'Connecting', type: 'stage' })
-    abortRef.current = new AbortController()
-    try {
-      const res = await fetch('http://localhost:8000/token', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ phone: 'unknown', customer_name: 'Customer' }),
-        signal:  abortRef.current.signal,
-      })
-      if (!res.ok) throw new Error(`Backend error ${res.status}`)
-      const data = (await res.json()) as { token: string; livekit_url: string }
-      setToken(data.token)
-      setLivekitUrl(data.livekit_url)
-      setCallState('connected')
-      pushActivity({ label: 'Session established', type: 'success' })
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name !== 'AbortError') {
-        setError(err.message)
-        setCallState('idle')
-        pushActivity({ label: 'Connection failed', type: 'error' })
-      }
-    }
-  }, [pushActivity])
-
-  const endCall = useCallback(() => {
-    abortRef.current?.abort()
-    setToken('')
-    setLivekitUrl('')
-    pushActivity({ label: 'Session terminated', type: 'error' })
-    setCallState('disconnected')
-    setTimeout(() => setCallState('idle'), 1200)
-  }, [pushActivity])
-
-  const isLive    = callState === 'connected'
-  const lastEvent = activity[0] ?? null
+    document.addEventListener('click', onDocClick)
+    return () => document.removeEventListener('click', onDocClick)
+  }, [])
 
   return (
-    <div className="app-root">
-      <aside className="activity-panel">
-        <div className="activity-header">AGENT STATE</div>
-
-        <div className="fsm-body">
-          <div className="fsm-diagram">
-            {FSM_STAGES.map((label, i) => {
-              const nodeState =
-                i < fsmStage  ? 'completed'
-                : i === fsmStage ? 'active'
-                : 'inactive'
-              const connDone = i < fsmStage
-              return (
-                <Fragment key={label}>
-                  <div className={`fsm-node fsm-node-${nodeState}`}>
-                    <span className="fsm-node-label">{label}</span>
-                  </div>
-                  {i === fsmStage && (
-                    <div className="fsm-status">{FSM_STATUS[i]}</div>
-                  )}
-                  {i < FSM_STAGES.length - 1 && (
-                    <div className={`fsm-conn${connDone ? ' fsm-conn-done' : ''}`}>
-                      <div className="fsm-conn-line" />
-                      <div className="fsm-conn-arrow" />
-                    </div>
-                  )}
-                </Fragment>
-              )
-            })}
-          </div>
-        </div>
-
-        <div className="fsm-footer">
-          <div className="fsm-divider" />
-          <div className="fsm-last-label">LAST EVENT</div>
-          {lastEvent && (
-            <div className="activity-event">
-              <span className="activity-ts">{lastEvent.timestamp}</span>
-              <span className="activity-dot" style={{ background: DOT_COLORS[lastEvent.type] }} />
-              <span className="activity-label">{lastEvent.label}</span>
-            </div>
-          )}
-        </div>
-      </aside>
-
-      <main className="main-panel">
-        <div className="top-bar">
-          <span className="top-title">Lupi</span>
-          <div className="top-status">
-            <span className={`status-dot ${isLive ? 'status-live' : 'status-off'}`} />
-            <span className="status-label">{isLive ? 'LIVE' : 'OFFLINE'}</span>
-          </div>
-        </div>
-
-        {callState === 'connected' ? (
-          <LiveKitRoom
-            className="lk-fill"
-            token={token}
-            serverUrl={livekitUrl}
-            connect={true}
-            audio={true}
-            video={false}
-            onDisconnected={endCall}
-          >
-            <RoomAudioRenderer />
-            <VoiceAgent
-              onDisconnect={endCall}
-              onActivity={pushActivity}
-              onFsmAdvance={handleFsmAdvance}
-              callDuration={callDuration}
-            />
-          </LiveKitRoom>
-        ) : (
-          <>
-            <div className="center-section">
-              <div className="orb-wrap orb-idle">
-                <div className="orb" />
-                <div className="orb-label">IDLE</div>
-              </div>
-            </div>
-
-            <div className="bottom-section">
-              <div className="transcript-lines" />
-              {error && <p className="error-msg">{error}</p>}
-              <div className="action-row action-center">
-                <button
-                  className="btn-init"
-                  onClick={startCall}
-                  disabled={callState === 'connecting'}
-                >
-                  {callState === 'connecting' ? 'CONNECTING' : 'INITIALIZE CALL'}
-                </button>
-              </div>
-            </div>
-          </>
-        )}
-      </main>
+    <div className={`contact${open ? ' open' : ''}`} ref={ref}>
+      <button className="trigger" onClick={() => setOpen((o) => !o)}>
+        <span className="pin" />
+        Contact
+      </button>
+      <div className="card">
+        <a href="mailto:abhinavsriharshaa@gmail.com">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+            <rect x="2" y="4" width="20" height="16" rx="2" />
+            <path d="m22 6-10 7L2 6" />
+          </svg>
+          <span>
+            Email me
+            <small>abhinavsriharshaa@gmail.com</small>
+          </span>
+        </a>
+        <div className="div" />
+        <a href="/resume.pdf" download="abhinav_sriharsha_resume.pdf">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <path d="M14 2v6h6M12 18v-6M9 15l3 3 3-3" />
+          </svg>
+          <span>
+            Download résumé
+            <small>PDF</small>
+          </span>
+        </a>
+      </div>
     </div>
+  )
+}
+
+// ── Tech strip ───────────────────────────────────────────────────────────────────
+
+function TechStrip() {
+  return (
+    <Reveal as="div" className="techstrip">
+      <div className="lab">The real-time pipeline</div>
+      <div className="techrow">
+        <span className="tech">
+          <img src="/logos/LiveKit-Logo-New.png" alt="LiveKit" />
+        </span>
+        <span className="tech">
+          <img src="/logos/deepgram.png" alt="Deepgram" />
+        </span>
+        <span className="tech">
+          <img src="/logos/groq.png" alt="Groq" style={{ height: '17px' }} />
+        </span>
+        <span className="tech">
+          <img src="/logos/llama.png" alt="Llama" style={{ height: '68px' }} />
+        </span>
+        <span className="tech">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 21s-6.9-4.5-9.2-8.9C1.1 9 2.4 5.4 5.9 5.4c2 0 3.3 1.2 4.1 2.4.8-1.2 2.1-2.4 4.1-2.4 3.5 0 4.8 3.6 3.1 6.7C14.9 16.5 12 21 12 21Z" />
+          </svg>
+          <span>Kokoro</span>
+        </span>
+        <span className="tech">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M13 2.2 4.1 13.6c-.5.6 0 1.4.7 1.4H11l-.9 6.9c-.1.8.9 1.2 1.4.6L20 10.4c.5-.6 0-1.4-.7-1.4H13l.9-6.2c.1-.8-.9-1.2-1.4-.6Z" transform="translate(.4 0)" />
+          </svg>
+          <span>Supabase</span>
+        </span>
+      </div>
+    </Reveal>
+  )
+}
+
+// ── Hero ───────────────────────────────────────────────────────────────────────
+
+const STATS = [
+  { value: '455', unit: 'ms', label: 'Avg time to first audio' },
+  { value: '246', unit: 'ms', label: 'Intent classification' },
+  { value: '114', unit: 'ms', label: 'Best time to first token' },
+  { value: '8B', unit: '+', suffix: '70B', label: 'Parallel LLM execution' },
+]
+
+function HeroSection() {
+  return (
+    <section className="hero" id="hero">
+      <div className="hero-grid">
+        <Reveal>
+          <div className="eyebrow">Real-time voice AI</div>
+          <h1>
+            Voice that thinks in <em>milliseconds.</em>
+          </h1>
+          <p className="lede">
+            Deepgram Nova-2 STT, Groq LLaMA 70B reasoning, and Kokoro local TTS
+            chained through a deterministic FSM. Sub-500ms turn latency, end to end.
+          </p>
+          <div className="stats">
+            {STATS.map((s) => (
+              <div className="stat" key={s.label}>
+                <div className="n">
+                  {s.value}
+                  <small>{s.unit}</small>
+                  {'suffix' in s && (s as { suffix: string }).suffix}
+                </div>
+                <div className="l">{s.label}</div>
+              </div>
+            ))}
+          </div>
+        </Reveal>
+
+        <Reveal as="div" className="orbside">
+          <VoiceStage
+            agentName="lupi-chat"
+            variant="violet"
+            idleLabel="Tap to talk"
+            ctaLabel="Talk to Lupi"
+            agentLabel="Lupi"
+          />
+        </Reveal>
+      </div>
+    </section>
+  )
+}
+
+// ── Production details (FSM + capabilities) ─────────────────────────────────────
+
+const FSM_STAGES = [
+  { key: 'intro', label: 'intro' },
+  { key: 'phone_collection', label: 'phone' },
+  { key: 'issue_collection', label: 'issue' },
+  { key: 'investigation', label: 'investigation' },
+  { key: 'resolution', label: 'resolution' },
+  { key: 'closing', label: 'closing' },
+]
+
+function FsmDiagram({ stage }: { stage: string | null }) {
+  const activeIndex = stage ? FSM_STAGES.findIndex((s) => s.key === stage) : -1
+
+  return (
+    <div className="fsm">
+      {FSM_STAGES.map((s, i) => {
+        const status = i === activeIndex ? 'active' : i < activeIndex ? 'done' : ''
+        return (
+          <div className={`node${status ? ` ${status}` : ''}`} key={s.key}>
+            <span className="pill">{s.label}</span>
+            {i < FSM_STAGES.length - 1 && <span className="seg" />}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function ProductionSection({ fsmStage }: { fsmStage: string | null }) {
+  return (
+    <section className="prod" id="prod">
+      <Reveal as="div" className="secthead">
+        <div className="kicker">Lupi in production</div>
+        <h2>A full support agent that never needs a human.</h2>
+        <p>
+          LupiDash is a working food-delivery support line. Lupi pulls the live order from a real database,
+          runs a pure-Python refund policy engine, and resolves the call on its own, from phone collection to payout.
+        </p>
+      </Reveal>
+
+      <Reveal as="div">
+        <FsmDiagram stage={fsmStage} />
+      </Reveal>
+
+      <Reveal as="div" className="caps">
+        <div className="cap">
+          <div className="ci">8</div>
+          <h4>Scenarios end to end</h4>
+          <p>Late, missing, wrong, refund, cancel, and more. All resolved without a handoff.</p>
+        </div>
+        <div className="cap">
+          <div className="ci">0</div>
+          <h4>Hallucinated refunds</h4>
+          <p>A pure-Python policy engine decides payouts from raw timestamps. The LLM never touches the math.</p>
+        </div>
+        <div className="cap">
+          <div className="ci">
+            246<span style={{ fontSize: '13px' }}>ms</span>
+          </div>
+          <h4>Intent routing</h4>
+          <p>A parallel Groq 8B classifier picks the path while the 70B model is already responding.</p>
+        </div>
+        <div className="cap">
+          <div className="ci">FSM</div>
+          <h4>Deterministic control</h4>
+          <p>Every action fires from a state machine, not the model. Same input, same path, every time.</p>
+        </div>
+      </Reveal>
+    </section>
+  )
+}
+
+// ── LupiDash live agent ──────────────────────────────────────────────────────────
+
+function LupiDashSection({ onData }: { onData: (data: unknown) => void }) {
+  return (
+    <section className="agent warm" id="lupidash">
+      <Reveal as="div" className="secthead">
+        <div className="kicker">Try it live</div>
+        <h2>Call LupiDash support</h2>
+        <p>A late order, a real account, a real refund. Watch the state machine advance with the call.</p>
+        <div className="test-numbers">
+          <div>Try: Maya (415) 555-0101, late delivery</div>
+          <div>Try: Jordan (415) 555-0102, missing items</div>
+        </div>
+      </Reveal>
+
+      <VoiceStage
+        agentName="lupi-agent"
+        variant="amber"
+        idleLabel="Ready"
+        ctaLabel="Call support"
+        agentLabel="Lupi"
+        onData={onData}
+      />
+    </section>
+  )
+}
+
+// ── App ────────────────────────────────────────────────────────────────────────
+
+export default function App() {
+  const [fsmStage, setFsmStage] = useState<string | null>(null)
+
+  const handleLupiDashData = (data: unknown) => {
+    const d = data as { type?: string; stage?: string }
+    if (d?.type === 'fsm_stage' && typeof d.stage === 'string') {
+      setFsmStage(d.stage)
+    }
+  }
+
+  return (
+    <>
+      <Wordmark />
+      <ContactCard />
+
+      <HeroSection />
+      <TechStrip />
+      <ProductionSection fsmStage={fsmStage} />
+      <LupiDashSection onData={handleLupiDashData} />
+
+      <footer>Built by Abhinav Sriharsha</footer>
+    </>
   )
 }

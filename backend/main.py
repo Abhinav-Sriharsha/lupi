@@ -16,12 +16,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+VALID_AGENTS = {"lupi-agent", "lupi-chat"}
+
 class TokenRequest(BaseModel):
     phone: str
     customer_name: str = ""
+    agent_name: str = "lupi-agent"
 
 @app.post("/token")
 async def get_token(req: TokenRequest):
+    if req.agent_name not in VALID_AGENTS:
+        raise HTTPException(status_code=400, detail=f"Unknown agent: {req.agent_name}")
     room_name = f"lupi-{int(time.time())}"
     token = (
         api.AccessToken(os.getenv("LIVEKIT_API_KEY"), os.getenv("LIVEKIT_API_SECRET"))
@@ -39,7 +44,7 @@ async def get_token(req: TokenRequest):
     await lk_api.agent_dispatch.create_dispatch(
         api.CreateAgentDispatchRequest(
             room=room_name,
-            agent_name="lupi-agent",
+            agent_name=req.agent_name,
             metadata=req.phone,
         )
     )

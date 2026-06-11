@@ -29,6 +29,7 @@ class KokoroTTS(tts.TTS):
         self._voice = voice
         self._speed = speed
         self._base_url = base_url
+        self.last_ttfc_ms: int = 0
 
     @asynccontextmanager
     async def synthesize(self, text: str, *, conn_options: Optional[APIConnectOptions] = None, **kwargs):
@@ -100,6 +101,7 @@ class KokoroChunkedStream(tts.ChunkedStream):
                             if first:
                                 ttfc = int((time.perf_counter() - t_start) * 1000)
                                 print(f"[KOKORO] First audio chunk in {ttfc}ms")
+                                self._tts.last_ttfc_ms = ttfc
                                 first = False
                             output_emitter.push(chunk)
                             total_bytes += len(chunk)
