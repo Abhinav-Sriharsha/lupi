@@ -1,7 +1,8 @@
 import { createVoiceSession, type RealtimeVoiceAdapter } from "@assistant-ui/react"
 import { Room, RoomEvent, Track } from "livekit-client"
 
-const TOKEN_ENDPOINT = "http://localhost:8000/token"
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000"
+const TOKEN_ENDPOINT = `${API_URL}/token`
 
 export type LiveKitVoiceAdapterOptions = {
   phone?: string

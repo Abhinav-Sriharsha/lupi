@@ -119,13 +119,22 @@ async def warmup_pipeline(stt: deepgram.STT):
     kokoro_url = os.getenv("KOKORO_URL", "http://127.0.0.1:8880")
 
     async def warm_tts():
+        if os.getenv("USE_RESEMBLE", "false").lower() == "true":
+            print("[WARMUP] Skipping Kokoro warmup (USE_RESEMBLE=true)")
+            return
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"{kokoro_url}/health") as resp:
-                    data = await resp.json()
-                    print(f"[WARMUP] Kokoro ready: {data}")
+                async with session.get(
+                    f"{kokoro_url}/health",
+                    timeout=aiohttp.ClientTimeout(total=3),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        print(f"[WARMUP] Kokoro ready: {data}")
+                    else:
+                        print(f"[WARMUP] Kokoro warmup failed: status {resp.status}, continuing without warmup")
         except Exception as e:
-            print(f"[WARMUP] Kokoro warmup failed (is kokoro_server.py running?): {e}")
+            print(f"[WARMUP] Kokoro not available: {e}, continuing without warmup")
 
     async def warm_stt():
         try:
