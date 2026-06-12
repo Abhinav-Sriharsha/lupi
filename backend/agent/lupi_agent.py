@@ -300,13 +300,6 @@ async def entrypoint(ctx: JobContext):
             lupi_tts = KokoroTTSPlugin(voice="af_sarah", speed=1.1, base_url=kokoro_url)
             print("[TTS] Using Kokoro local")
 
-        def capture_kokoro_ttfc():
-            """Read and reset Kokoro's first-chunk latency."""
-            if hasattr(lupi_tts, 'last_ttfc_ms'):
-                ttfc = lupi_tts.last_ttfc_ms
-                lupi_tts.last_ttfc_ms = 0
-                return ttfc
-            return 0
         lupi_vad = silero.VAD.load(
             min_speech_duration=0.1,
             min_silence_duration=0.5,
@@ -496,9 +489,6 @@ async def entrypoint(ctx: JobContext):
             if hasattr(msg, "role") and msg.role == "assistant":
                 response = msg.text_content or ""
                 print(f"[AGENT]: {response}")
-                if observer.current:
-                    observer.current.tts_first_chunk_ms = capture_kokoro_ttfc()
-                    print(f"[LATENCY] TTS first chunk: {observer.current.tts_first_chunk_ms}ms")
                 observer.on_agent_speech_committed(response)
                 if observer.current:
                     asyncio.create_task(publish_turn_metrics(observer.current))
