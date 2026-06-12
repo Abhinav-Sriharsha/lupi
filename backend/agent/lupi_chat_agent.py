@@ -64,10 +64,12 @@ class SessionObserver:
         self.turns: list[TurnMetrics] = []
         self.current: TurnMetrics | None = None
         self.t_start: float = 0
+        self._tts_seen: bool = False
 
     def on_user_speech(self, transcript: str):
         self.turn_count += 1
         self.t_start = time.perf_counter()
+        self._tts_seen = False
         self.current = TurnMetrics(turn=self.turn_count, transcript=transcript)
         self.turns.append(self.current)
         print(f"[TURN {self.turn_count}] User: {transcript}")
@@ -82,8 +84,14 @@ class SessionObserver:
             self.current.llm_ms = round(agent_metrics.inference_duration * 1000)
             print(f"[LATENCY] LLM: {self.current.llm_ms}ms")
         if hasattr(agent_metrics, "duration") and agent_metrics.duration:
-            self.current.tts_total_ms = round(agent_metrics.duration * 1000)
-            print(f"[LATENCY] TTS: {self.current.tts_total_ms}ms")
+            tts_val = round(agent_metrics.duration * 1000)
+            if not self._tts_seen:
+                self.current.tts_first_chunk_ms = tts_val
+                self._tts_seen = True
+                print(f"[LATENCY] TTS first chunk: {tts_val}ms")
+            else:
+                self.current.tts_total_ms = tts_val
+                print(f"[LATENCY] TTS total: {tts_val}ms")
 
     def on_agent_speech_committed(self, response: str):
         if self.current:
@@ -175,11 +183,6 @@ async def entrypoint(ctx: JobContext):
     lupi_tts = KokoroTTSPlugin(voice="af_sarah", speed=1.1, base_url=kokoro_url)
     print("[TTS] Using Kokoro local")
 
-    def capture_kokoro_ttfc():
-        """Read and reset Kokoro's first-chunk latency."""
-        ttfc = lupi_tts.last_ttfc_ms
-        lupi_tts.last_ttfc_ms = 0
-        return ttfc
     lupi_vad = silero.VAD.load(
         min_speech_duration=0.1,
         min_silence_duration=0.5,
@@ -242,9 +245,6 @@ async def entrypoint(ctx: JobContext):
         if hasattr(msg, "role") and msg.role == "assistant":
             response = msg.text_content or ""
             print(f"[AGENT]: {response}")
-            if observer.current:
-                observer.current.tts_first_chunk_ms = capture_kokoro_ttfc()
-                print(f"[LATENCY] TTS first chunk: {observer.current.tts_first_chunk_ms}ms")
             observer.on_agent_speech_committed(response)
             if observer.current:
                 asyncio.create_task(publish_turn_metrics(observer.current))

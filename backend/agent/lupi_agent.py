@@ -67,10 +67,12 @@ class SessionObserver:
         self.turns: list[TurnMetrics] = []
         self.current: TurnMetrics | None = None
         self.t_start: float = 0
+        self._tts_seen: bool = False
 
     def on_user_speech(self, transcript: str):
         self.turn_count += 1
         self.t_start = time.perf_counter()
+        self._tts_seen = False
         self.current = TurnMetrics(turn=self.turn_count, transcript=transcript)
         self.turns.append(self.current)
         print(f"[TURN {self.turn_count}] User: {transcript}")
@@ -85,8 +87,14 @@ class SessionObserver:
             self.current.llm_ms = round(agent_metrics.inference_duration * 1000)
             print(f"[LATENCY] LLM: {self.current.llm_ms}ms")
         if hasattr(agent_metrics, "duration") and agent_metrics.duration:
-            self.current.tts_total_ms = round(agent_metrics.duration * 1000)
-            print(f"[LATENCY] TTS: {self.current.tts_total_ms}ms")
+            tts_val = round(agent_metrics.duration * 1000)
+            if not self._tts_seen:
+                self.current.tts_first_chunk_ms = tts_val
+                self._tts_seen = True
+                print(f"[LATENCY] TTS first chunk: {tts_val}ms")
+            else:
+                self.current.tts_total_ms = tts_val
+                print(f"[LATENCY] TTS total: {tts_val}ms")
 
     def on_agent_speech_committed(self, response: str):
         if self.current:
@@ -209,350 +217,377 @@ def _build_context_block(ctx: dict) -> str:
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
 
 async def entrypoint(ctx: JobContext):
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    try:
+        await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    customer_phone = ctx.job.metadata or ""
-    print(f"[LUPI] Phone from room metadata: {customer_phone!r}")
+        customer_phone = ctx.job.metadata or ""
+        print(f"[LUPI] Phone from room metadata: {customer_phone!r}")
 
-    observer = SessionObserver()
+        observer = SessionObserver()
 
-    async def publish_fsm_stage(stage: str):
-        payload = json.dumps({"type": "fsm_stage", "stage": stage})
-        try:
-            await ctx.room.local_participant.publish_data(
-                payload.encode("utf-8"), reliable=True
-            )
-            print(f"[FSM] Published stage: {stage}")
-        except Exception as e:
-            print(f"[FSM] Stage publish failed: {e}")
-
-    fsm = LupiFSM()
-    fsm.on_stage_change = lambda stage: asyncio.create_task(publish_fsm_stage(stage))
-    print(f"[FSM] Initialized: {fsm.stage.value}")
-
-    state = {"greeting_done": False, "phone_done": False}
-    digit_buffer: list[str] = []
-
-    import re as _re
-
-    def _extract_digits(text: str) -> list[str]:
-        word_map = {
-            'zero':'0','one':'1','two':'2','three':'3','four':'4',
-            'five':'5','six':'6','seven':'7','eight':'8','nine':'9',
-        }
-        results = []
-        tokens = text.lower().split()
-        for token in tokens:
-            clean = ''.join(c for c in token if c.isalnum())
-            if clean in word_map:
-                results.append(word_map[clean])
-            elif clean.isdigit():
-                results.extend(list(clean))
-        return results
-
-    phrase_cache: dict[str, bytes] = {}
-
-    async def precache_phrase(text: str, key: str):
-        if os.getenv("USE_RESEMBLE", "false").lower() == "true":
-            return
-        kokoro_url = os.getenv("KOKORO_URL", "http://127.0.0.1:8880")
-        try:
-            async with aiohttp.ClientSession() as http:
-                async with http.post(
-                    f"{kokoro_url}/synthesize_cache",
-                    json={"text": text, "voice": "af_sarah", "speed": 1.1},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    resp.raise_for_status()
-                    pcm_bytes = await resp.read()
-                    phrase_cache[key] = pcm_bytes
-                    print(f"[CACHE] Pre-synthesized '{key}': {len(pcm_bytes)} bytes")
-        except Exception as e:
-            print(f"[CACHE] Failed to cache '{key}': {e}")
-
-    # ── Plugins ────────────────────────────────────────────────────────────────
-    kokoro_url = os.getenv("KOKORO_URL", "http://127.0.0.1:8880")
-
-    lupi_stt = deepgram.STT(
-        model="nova-2",
-        language="en-US",
-        punctuate=True,
-        smart_format=True,
-    )
-    use_resemble = os.getenv("USE_RESEMBLE", "false").lower() == "true"
-    if use_resemble:
-        lupi_tts = ResembleTTS(
-            api_key=os.getenv("RESEMBLE_API_KEY"),
-            voice_uuid=os.getenv("RESEMBLE_VOICE_UUID"),
-            rate="100%"
-        )
-        print("[TTS] Using Resemble AI")
-    else:
-        lupi_tts = KokoroTTSPlugin(voice="af_sarah", speed=1.1, base_url=kokoro_url)
-        print("[TTS] Using Kokoro local")
-
-    def capture_kokoro_ttfc():
-        """Read and reset Kokoro's first-chunk latency."""
-        if hasattr(lupi_tts, 'last_ttfc_ms'):
-            ttfc = lupi_tts.last_ttfc_ms
-            lupi_tts.last_ttfc_ms = 0
-            return ttfc
-        return 0
-    lupi_vad = silero.VAD.load(
-        min_speech_duration=0.1,
-        min_silence_duration=0.5,
-        prefix_padding_duration=0.2,
-    )
-    groq_client = AsyncOpenAI(
-        api_key=os.getenv("GROQ_API_KEY"),
-        base_url="https://api.groq.com/openai/v1",
-    )
-    lupi_llm = lk_openai.LLM(client=groq_client, model="llama-3.3-70b-versatile")
-
-    await warmup_pipeline(lupi_stt)
-
-    # Pre-cache disclaimer only — FSM phrases are dynamic and spoken directly
-    async def _run_cache():
-        await precache_phrase(
-            "Just so you know, this call may be recorded for quality and security purposes.",
-            "disclaimer"
-        )
-    cache_task = asyncio.create_task(_run_cache())
-
-    # ── Tools ──────────────────────────────────────────────────────────────────
-
-    # Plain Python dict — used by FSM on_enter to call tools directly without LLM
-    tools_registry = {
-        "get_order_details": get_order_details,
-        "get_order_status": get_order_status,
-"issue_refund": issue_refund,
-        "create_support_ticket": create_support_ticket,
-    }
-
-    # Only get_dasher_location remains as an LLM-callable tool
-    @lk_llm.function_tool(
-        name="get_dasher_location",
-        description=(
-            "Get the most recent GPS event for the dasher on an active order. "
-            "Use when the customer asks where their dasher is or how far away they are."
-        ),
-    )
-    async def tool_get_dasher_location(order_number: str) -> str:
-        result = await get_dasher_location(order_number)
-        return str(result)
-
-    all_tools_dict = {
-        "get_dasher_location": tool_get_dasher_location,
-    }
-
-    # ── Agent ──────────────────────────────────────────────────────────────────
-
-    agent = Agent(
-        instructions=fsm.get_prompt(),
-        tools=fsm.get_tools(all_tools_dict),
-    )
-
-    def rebuild_agent():
-        agent._instructions = fsm.get_prompt()
-        agent._tools = fsm.get_tools(all_tools_dict)
-        print(f"[FSM] Rebuilt for stage: {fsm.stage.value} | tools: {STAGE_TOOLS[fsm.stage]}")
-
-    session = AgentSession(
-        stt=lupi_stt,
-        vad=lupi_vad,
-        llm=lupi_llm,
-        tts=lupi_tts,
-        turn_handling=TurnHandlingOptions(
-            interruption={"enabled": True, "min_duration": 0.5, "min_words": 2},
-            endpointing={"min_delay": 0.6},
-        ),
-    )
-
-    # ── Async task helpers ─────────────────────────────────────────────────────
-
-    async def _do_phone_lookup(phone: str):
-        result = await get_customer_context(phone)
-        if result.get("error"):
-            state["phone_done"] = False
-            digit_buffer.clear()
+        async def publish_fsm_stage(stage: str):
+            payload = json.dumps({"type": "fsm_stage", "stage": stage})
             try:
-                session.say(
-                    "I wasn't able to find an account with that number. Can you try again?",
-                    allow_interruptions=True,
+                await ctx.room.local_participant.publish_data(
+                    payload.encode("utf-8"), reliable=True
                 )
+                print(f"[FSM] Published stage: {stage}")
+            except Exception as e:
+                print(f"[FSM] Stage publish failed: {e}")
+
+        fsm = LupiFSM()
+        fsm.on_stage_change = lambda stage: asyncio.create_task(publish_fsm_stage(stage))
+        print(f"[FSM] Initialized: {fsm.stage.value}")
+
+        state = {"greeting_done": False, "phone_done": False}
+        digit_buffer: list[str] = []
+
+        import re as _re
+
+        def _extract_digits(text: str) -> list[str]:
+            word_map = {
+                'zero':'0','one':'1','two':'2','three':'3','four':'4',
+                'five':'5','six':'6','seven':'7','eight':'8','nine':'9',
+            }
+            results = []
+            tokens = text.lower().split()
+            for token in tokens:
+                clean = ''.join(c for c in token if c.isalnum())
+                if clean in word_map:
+                    results.append(word_map[clean])
+                elif clean.isdigit():
+                    results.extend(list(clean))
+            return results
+
+        phrase_cache: dict[str, bytes] = {}
+
+        async def precache_phrase(text: str, key: str):
+            if os.getenv("USE_RESEMBLE", "false").lower() == "true":
+                return
+            kokoro_url = os.getenv("KOKORO_URL", "http://127.0.0.1:8880")
+            try:
+                async with aiohttp.ClientSession() as http:
+                    async with http.post(
+                        f"{kokoro_url}/synthesize_cache",
+                        json={"text": text, "voice": "af_sarah", "speed": 1.1},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        resp.raise_for_status()
+                        pcm_bytes = await resp.read()
+                        phrase_cache[key] = pcm_bytes
+                        print(f"[CACHE] Pre-synthesized '{key}': {len(pcm_bytes)} bytes")
+            except Exception as e:
+                print(f"[CACHE] Failed to cache '{key}': {e}")
+
+        # ── Plugins ────────────────────────────────────────────────────────────────
+        kokoro_url = os.getenv("KOKORO_URL", "http://127.0.0.1:8880")
+
+        lupi_stt = deepgram.STT(
+            model="nova-2",
+            language="en-US",
+            punctuate=True,
+            smart_format=True,
+        )
+        use_resemble = os.getenv("USE_RESEMBLE", "false").lower() == "true"
+        if use_resemble:
+            lupi_tts = ResembleTTS(
+                api_key=os.getenv("RESEMBLE_API_KEY"),
+                voice_uuid=os.getenv("RESEMBLE_VOICE_UUID"),
+                rate="100%"
+            )
+            print("[TTS] Using Resemble AI")
+        else:
+            lupi_tts = KokoroTTSPlugin(voice="af_sarah", speed=1.1, base_url=kokoro_url)
+            print("[TTS] Using Kokoro local")
+
+        def capture_kokoro_ttfc():
+            """Read and reset Kokoro's first-chunk latency."""
+            if hasattr(lupi_tts, 'last_ttfc_ms'):
+                ttfc = lupi_tts.last_ttfc_ms
+                lupi_tts.last_ttfc_ms = 0
+                return ttfc
+            return 0
+        lupi_vad = silero.VAD.load(
+            min_speech_duration=0.1,
+            min_silence_duration=0.5,
+            prefix_padding_duration=0.2,
+        )
+        groq_client = AsyncOpenAI(
+            api_key=os.getenv("GROQ_API_KEY"),
+            base_url="https://api.groq.com/openai/v1",
+        )
+        lupi_llm = lk_openai.LLM(client=groq_client, model="llama-3.3-70b-versatile")
+
+        await warmup_pipeline(lupi_stt)
+
+        # Pre-cache disclaimer only — FSM phrases are dynamic and spoken directly
+        async def _run_cache():
+            await precache_phrase(
+                "Just so you know, this call may be recorded for quality and security purposes.",
+                "disclaimer"
+            )
+        cache_task = asyncio.create_task(_run_cache())
+
+        # ── Tools ──────────────────────────────────────────────────────────────────
+
+        # Plain Python dict — used by FSM on_enter to call tools directly without LLM
+        tools_registry = {
+            "get_order_details": get_order_details,
+            "get_order_status": get_order_status,
+    "issue_refund": issue_refund,
+            "create_support_ticket": create_support_ticket,
+        }
+
+        # Only get_dasher_location remains as an LLM-callable tool
+        @lk_llm.function_tool(
+            name="get_dasher_location",
+            description=(
+                "Get the most recent GPS event for the dasher on an active order. "
+                "Use when the customer asks where their dasher is or how far away they are."
+            ),
+        )
+        async def tool_get_dasher_location(order_number: str) -> str:
+            result = await get_dasher_location(order_number)
+            return str(result)
+
+        all_tools_dict = {
+            "get_dasher_location": tool_get_dasher_location,
+        }
+
+        # ── Agent ──────────────────────────────────────────────────────────────────
+
+        agent = Agent(
+            instructions=fsm.get_prompt(),
+            tools=fsm.get_tools(all_tools_dict),
+        )
+
+        def rebuild_agent():
+            agent._instructions = fsm.get_prompt()
+            agent._tools = fsm.get_tools(all_tools_dict)
+            print(f"[FSM] Rebuilt for stage: {fsm.stage.value} | tools: {STAGE_TOOLS[fsm.stage]}")
+
+        session = AgentSession(
+            stt=lupi_stt,
+            vad=lupi_vad,
+            llm=lupi_llm,
+            tts=lupi_tts,
+            turn_handling=TurnHandlingOptions(
+                interruption={"enabled": True, "min_duration": 0.5, "min_words": 2},
+                endpointing={"min_delay": 0.6},
+            ),
+        )
+
+        # ── Async task helpers ─────────────────────────────────────────────────────
+
+        async def _do_phone_lookup(phone: str):
+            result = await get_customer_context(phone)
+            if result.get("error"):
+                state["phone_done"] = False
+                digit_buffer.clear()
+                try:
+                    session.say(
+                        "I wasn't able to find an account with that number. Can you try again?",
+                        allow_interruptions=True,
+                    )
+                except RuntimeError:
+                    pass
+                return
+            fsm.customer_ctx = result
+            fsm.first_name = (result.get("full_name") or "").split()[0]
+            orders = result.get("recent_orders") or []
+            if orders:
+                fsm.order_number = orders[0].get("order_number", "")
+            await fsm.enter("phone_collected", session, tools_registry)
+            rebuild_agent()
+
+        async def _classify_and_enter(transcript: str):
+            issue_type = await classify_issue(transcript)
+            fsm.issue_type = issue_type
+            await fsm.enter("issue_detected", session, tools_registry)
+            rebuild_agent()
+            await fsm.enter("eligibility_checked", session, tools_registry)
+            rebuild_agent()
+
+        async def _enter_greeted():
+            await asyncio.sleep(0.5)
+            try:
+                await fsm.enter("greeted", session, tools_registry)
+                rebuild_agent()
+                print("[FSM] greeted transition complete")
+            except Exception as e:
+                print(f"[FSM] _enter_greeted error: {e}")
+
+        async def _handle_follow_up():
+            await fsm.enter("follow_up_question", session, tools_registry)
+            rebuild_agent()
+
+        async def _ask_for_more_digits():
+            await asyncio.sleep(0.1)
+            try:
+                session.say("Can I get the rest of your number?", allow_interruptions=True)
             except RuntimeError:
                 pass
-            return
-        fsm.customer_ctx = result
-        fsm.first_name = (result.get("full_name") or "").split()[0]
-        orders = result.get("recent_orders") or []
-        if orders:
-            fsm.order_number = orders[0].get("order_number", "")
-        await fsm.enter("phone_collected", session, tools_registry)
-        rebuild_agent()
 
-    async def _classify_and_enter(transcript: str):
-        issue_type = await classify_issue(transcript)
-        fsm.issue_type = issue_type
-        await fsm.enter("issue_detected", session, tools_registry)
-        rebuild_agent()
-        await fsm.enter("eligibility_checked", session, tools_registry)
-        rebuild_agent()
+        # ── Observability hooks ────────────────────────────────────────────────────
 
-    async def _enter_greeted():
-        await asyncio.sleep(0.5)
-        try:
-            await fsm.enter("greeted", session, tools_registry)
-            rebuild_agent()
-            print("[FSM] greeted transition complete")
-        except Exception as e:
-            print(f"[FSM] _enter_greeted error: {e}")
+        @session.on("user_input_transcribed")
+        def on_user_speech(ev):
+            if not ev.is_final:
+                return
+            observer.on_user_speech(ev.transcript)
 
-    async def _handle_follow_up():
-        await fsm.enter("follow_up_question", session, tools_registry)
-        rebuild_agent()
+            if not state["greeting_done"]:
+                print(f"[LUPI] Ignoring early transcript, greeting not done yet: {ev.transcript}")
+                return
 
-    async def _ask_for_more_digits():
-        await asyncio.sleep(0.1)
-        try:
-            session.say("Can I get the rest of your number?", allow_interruptions=True)
-        except RuntimeError:
-            pass
+            # INTRO: interrupt any preemptive generation, then advance FSM
+            if fsm.stage == LupiStage.INTRO:
+                asyncio.create_task(_enter_greeted())
+                return
 
-    # ── Observability hooks ────────────────────────────────────────────────────
+            if fsm.stage == LupiStage.PHONE_COLLECTION:
+                try:
+                    session.interrupt()
+                except Exception:
+                    pass
+                new_digits = _extract_digits(ev.transcript)
+                if new_digits:
+                    digit_buffer.extend(new_digits)
+                    print(f"[PHONE] Buffer: {''.join(digit_buffer)} ({len(digit_buffer)} digits)")
+                    if len(digit_buffer) >= 10:
+                        state["phone_done"] = True
+                        phone = '+1' + ''.join(digit_buffer[:10])
+                        print(f"[PHONE] Complete: {phone}")
+                        asyncio.create_task(_do_phone_lookup(phone))
+                    else:
+                        asyncio.create_task(_ask_for_more_digits())
+                return
 
-    @session.on("user_input_transcribed")
-    def on_user_speech(ev):
-        if not ev.is_final:
-            return
-        observer.on_user_speech(ev.transcript)
+            # ISSUE_COLLECTION: classify → investigation → resolution → closing
+            if fsm.stage == LupiStage.ISSUE_COLLECTION:
+                asyncio.create_task(_classify_and_enter(ev.transcript))
+                return
 
-        if not state["greeting_done"]:
-            print(f"[LUPI] Ignoring early transcript, greeting not done yet: {ev.transcript}")
-            return
+            # All other stages: pass through to LLM
 
-        # INTRO: interrupt any preemptive generation, then advance FSM
-        if fsm.stage == LupiStage.INTRO:
-            asyncio.create_task(_enter_greeted())
-            return
+        # ── Metrics → frontend via data channel ────────────────────────────────────
 
-        if fsm.stage == LupiStage.PHONE_COLLECTION:
+        async def publish_turn_metrics(turn: TurnMetrics):
+            payload = json.dumps({
+                "type": "metrics",
+                "turn": turn.turn,
+                "ttft_ms": turn.ttft_ms,
+                "tts_first_chunk_ms": turn.tts_first_chunk_ms,
+                "tts_total_ms": turn.tts_total_ms,
+                "ttfa_ms": turn.ttft_ms + turn.tts_first_chunk_ms,
+                "total_ms": turn.total_ms,
+            })
             try:
-                session.interrupt()
-            except Exception:
-                pass
-            new_digits = _extract_digits(ev.transcript)
-            if new_digits:
-                digit_buffer.extend(new_digits)
-                print(f"[PHONE] Buffer: {''.join(digit_buffer)} ({len(digit_buffer)} digits)")
-                if len(digit_buffer) >= 10:
-                    state["phone_done"] = True
-                    phone = '+1' + ''.join(digit_buffer[:10])
-                    print(f"[PHONE] Complete: {phone}")
-                    asyncio.create_task(_do_phone_lookup(phone))
-                else:
-                    asyncio.create_task(_ask_for_more_digits())
-            return
+                await ctx.room.local_participant.publish_data(
+                    payload.encode("utf-8"), reliable=True
+                )
+                print(f"[METRICS] Published: {payload}")
+            except Exception as e:
+                print(f"[METRICS] Publish failed: {e}")
 
-        # ISSUE_COLLECTION: classify → investigation → resolution → closing
-        if fsm.stage == LupiStage.ISSUE_COLLECTION:
-            asyncio.create_task(_classify_and_enter(ev.transcript))
-            return
+        @session.on("conversation_item_added")
+        def on_item_added(ev):
+            msg = ev.item
+            if hasattr(msg, "role") and msg.role == "assistant":
+                response = msg.text_content or ""
+                print(f"[AGENT]: {response}")
+                if observer.current:
+                    observer.current.tts_first_chunk_ms = capture_kokoro_ttfc()
+                    print(f"[LATENCY] TTS first chunk: {observer.current.tts_first_chunk_ms}ms")
+                observer.on_agent_speech_committed(response)
+                if observer.current:
+                    asyncio.create_task(publish_turn_metrics(observer.current))
+                # Detect FOLLOW_UP signal from LLM
+                if "FOLLOW_UP" in response.upper() and fsm.stage == LupiStage.CLOSING:
+                    print("[FSM] Follow-up detected — routing back to investigation")
+                    asyncio.create_task(_handle_follow_up())
 
-        # All other stages: pass through to LLM
+        @session.on("agent_state_changed")
+        def on_agent_state(ev):
+            if ev.old_state == "speaking" and ev.new_state != "speaking":
+                print("[BARGE-IN] Agent interrupted mid-speech")
 
-    # ── Metrics → frontend via data channel ────────────────────────────────────
+        @session.on("metrics_collected")
+        def on_metrics(ev):
+            observer.on_metrics(ev.metrics)
 
-    async def publish_turn_metrics(turn: TurnMetrics):
-        payload = json.dumps({
-            "type": "metrics",
-            "turn": turn.turn,
-            "ttft_ms": turn.ttft_ms,
-            "tts_first_chunk_ms": turn.tts_first_chunk_ms,
-            "tts_total_ms": turn.tts_total_ms,
-            "ttfa_ms": turn.ttft_ms + turn.tts_first_chunk_ms,
-            "total_ms": turn.total_ms,
-        })
-        try:
-            await ctx.room.local_participant.publish_data(
-                payload.encode("utf-8"), reliable=True
-            )
-            print(f"[METRICS] Published: {payload}")
-        except Exception as e:
-            print(f"[METRICS] Publish failed: {e}")
+        # ── Start ──────────────────────────────────────────────────────────────────
 
-    @session.on("conversation_item_added")
-    def on_item_added(ev):
-        msg = ev.item
-        if hasattr(msg, "role") and msg.role == "assistant":
-            response = msg.text_content or ""
-            print(f"[AGENT]: {response}")
-            if observer.current:
-                observer.current.tts_first_chunk_ms = capture_kokoro_ttfc()
-                print(f"[LATENCY] TTS first chunk: {observer.current.tts_first_chunk_ms}ms")
-            observer.on_agent_speech_committed(response)
-            if observer.current:
-                asyncio.create_task(publish_turn_metrics(observer.current))
-            # Detect FOLLOW_UP signal from LLM
-            if "FOLLOW_UP" in response.upper() and fsm.stage == LupiStage.CLOSING:
-                print("[FSM] Follow-up detected — routing back to investigation")
-                asyncio.create_task(_handle_follow_up())
+        participant = await ctx.wait_for_participant()
+        print(f"[LUPI] Participant: {participant.identity}")
 
-    @session.on("agent_state_changed")
-    def on_agent_state(ev):
-        if ev.old_state == "speaking" and ev.new_state != "speaking":
-            print("[BARGE-IN] Agent interrupted mid-speech")
+        await session.start(agent, room=ctx.room)
+        asyncio.create_task(publish_fsm_stage(fsm.stage.value))
 
-    @session.on("metrics_collected")
-    def on_metrics(ev):
-        observer.on_metrics(ev.metrics)
+        @session.on("participant_disconnected")
+        def on_disconnect(p):
+            print(f"[LUPI] Participant disconnected")
 
-    # ── Start ──────────────────────────────────────────────────────────────────
-
-    participant = await ctx.wait_for_participant()
-    print(f"[LUPI] Participant: {participant.identity}")
-
-    await session.start(agent, room=ctx.room)
-    asyncio.create_task(publish_fsm_stage(fsm.stage.value))
-
-    @session.on("participant_disconnected")
-    def on_disconnect(p):
-        print(f"[LUPI] Participant disconnected")
-
-    await asyncio.sleep(2.5)
-    try:
-        await asyncio.wait_for(cache_task, timeout=8.0)
-    except Exception as e:
-        print(f"[CACHE] Cache task did not complete: {e}")
-
-    try:
-        if "disclaimer" in phrase_cache:
-            print("[LUPI] Playing cached disclaimer")
-        session.say(
-            "Just so you know, this call may be recorded for quality and security purposes.",
-            allow_interruptions=False,
-        )
         await asyncio.sleep(2.5)
+        try:
+            await asyncio.wait_for(cache_task, timeout=8.0)
+        except Exception as e:
+            print(f"[CACHE] Cache task did not complete: {e}")
 
-        greeting = "Hi, this is Lupi from LupiDash. How are you today?"
-        print(f"[LUPI] Greeting: {greeting}")
-        session.say(greeting, allow_interruptions=True)
-        await asyncio.sleep(0.1)
-        state["greeting_done"] = True
-        print("[LUPI] Greeting complete, ready for input")
-    except RuntimeError as e:
-        print(f"[LUPI] Session already closing, skipping greeting: {e}")
+        try:
+            if "disclaimer" in phrase_cache:
+                print("[LUPI] Playing cached disclaimer")
+            session.say(
+                "Just so you know, this call may be recorded for quality and security purposes.",
+                allow_interruptions=False,
+            )
+            await asyncio.sleep(2.5)
 
-    try:
-        await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        print("[LUPI] Session ended cleanly")
-        observer.print_summary()
+            greeting = "Hi, this is Lupi from LupiDash. How are you today?"
+            print(f"[LUPI] Greeting: {greeting}")
+            session.say(greeting, allow_interruptions=True)
+            await asyncio.sleep(0.1)
+            state["greeting_done"] = True
+            print("[LUPI] Greeting complete, ready for input")
+        except RuntimeError as e:
+            print(f"[LUPI] Session already closing, skipping greeting: {e}")
+
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            print("[LUPI] Session ended cleanly")
+            observer.print_summary()
+    except Exception as e:
+        import traceback
+        print(f"[LUPI-AGENT] FATAL ERROR in entrypoint: {e}")
+        traceback.print_exc()
+        raise
 
 
 # ── Worker ─────────────────────────────────────────────────────────────────────
+
+print(f"[LUPI-AGENT] Starting up, Python {sys.version}")
+print(f"[LUPI-AGENT] Importing dependencies...")
+
+try:
+    from lupi.fsm import LupiFSM, LupiStage
+    print("[LUPI-AGENT] FSM import OK")
+except Exception as e:
+    print(f"[LUPI-AGENT] FSM import FAILED: {e}")
+
+try:
+    from lupi.classifier import classify_issue
+    print("[LUPI-AGENT] Classifier import OK")
+except Exception as e:
+    print(f"[LUPI-AGENT] Classifier import FAILED: {e}")
+
+try:
+    from lupi.tools import get_order_details
+    print("[LUPI-AGENT] Tools import OK")
+except Exception as e:
+    print(f"[LUPI-AGENT] Tools import FAILED: {e}")
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(
